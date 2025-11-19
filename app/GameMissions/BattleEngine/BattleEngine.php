@@ -2,6 +2,7 @@
 
 namespace OGame\GameMissions\BattleEngine;
 
+use Illuminate\Support\Facades\Log;
 use OGame\GameMissions\BattleEngine\Models\BattleResult;
 use OGame\GameMissions\BattleEngine\Models\BattleResultRound;
 use OGame\GameMissions\BattleEngine\Services\LootService;
@@ -69,6 +70,8 @@ abstract class BattleEngine
      */
     public function simulateBattle(): BattleResult
     {
+        $tStart = hrtime(true);
+
         $result = new BattleResult();
 
         // Initialize the battle result object with the attacker and defender information.
@@ -88,8 +91,11 @@ abstract class BattleEngine
         $result->defenderUnitsStart->addCollection($this->defenderPlanet->getDefenseUnits());
         $result->defenderUnitsResult = clone $result->defenderUnitsStart;
 
+        $tSetupEnd = hrtime(true);
+
         // Execute the battle rounds, this will handle the actual combat logic.
         $result->rounds = $this->fightBattleRounds($result);
+        $tFightEnd = hrtime(true);
 
         // Sanitize the round array to make sure that the remaining attacker and defender units
         // for every round contain the starting unit types, even if there are no units of that type left.
@@ -145,6 +151,34 @@ abstract class BattleEngine
             $result->moonChance = $this->calculateMoonChance($result->debris);
             $result->moonCreated = $this->rollMoonCreation($result->moonChance);
         }
+
+        $tPostEnd = hrtime(true);
+
+        // ------------------------
+        // PERFORMANCE + MEMORY LOG
+        // ------------------------
+        $setupMs = ($tSetupEnd - $tStart)       / 1e6;
+        $fightMs = ($tFightEnd - $tSetupEnd)    / 1e6;
+        $postMs  = ($tPostEnd - $tFightEnd)     / 1e6;
+        $totalMs = ($tPostEnd - $tStart)        / 1e6;
+
+        // Memory
+        $memUsage   = (float)memory_get_usage(true)         / 1048576; // MB
+        $memPeak    = (float)memory_get_peak_usage(true)    / 1048576; // MB
+
+        Log::info(sprintf(
+            "BattleEngine Report | engine=%s | rounds=%d | attackerUnits=%d | defenderUnits=%d | time_total=%.3f ms | setup=%.3f ms | fight=%.3f ms | post=%.3f ms | mem=%.2f MB | mem_peak=%.2f MB",
+            static::class,
+            count($result->rounds),
+            $result->attackerUnitsStart->getAmount(),
+            $result->defenderUnitsStart->getAmount(),
+            $totalMs,
+            $setupMs,
+            $fightMs,
+            $postMs,
+            $this->getProcessMemoryUsageMb(),
+            $this->getProcessMemoryPeakMb()
+        ));
 
         return $result;
     }
@@ -261,5 +295,60 @@ abstract class BattleEngine
     {
         $dice = random_int(1, 100);
         return $dice <= $moonChance;
+    }
+
+    /**
+     * Get approximate process-wide memory usage in MB (includes Rust allocations).
+     *
+     * On Linux, this uses /proc/self/statm to read the resident set size (RSS),
+     * which covers the whole process (PHP + Rust + extensions).
+     * On other platforms, it falls back to PHP's memory_get_usage().
+     */
+    private function getProcessMemoryUsageMb(): float
+    {
+        // Linux-specific: read RSS from /proc/self/statm
+        if (PHP_OS_FAMILY === 'Linux' && is_readable('/proc/self/statm')) {
+            $statm = @file_get_contents('/proc/self/statm');
+            if ($statm !== false && trim($statm) !== '') {
+                $parts = explode(' ', trim($statm));
+                if (count($parts) >= 2) {
+                    // statm: size resident share text lib data dt
+                    $residentPages = (int)$parts[1];
+                    // Most Linux systems use 4096-byte pages
+                    $pageSize = 4096;
+                    $bytes = (float)$residentPages * $pageSize;
+                    return $bytes / 1048576; // MB
+                }
+            }
+        }
+
+        // Fallback: PHP heap only
+        return (float)memory_get_usage(true) / 1048576;
+    }
+
+    /**
+     * Get the real peak resident set size (RSS) in MB for the entire process,
+     * including Rust allocations that may already be freed by the time logging occurs.
+     *
+     * VmHWM (High Water Mark) is the true peak physical memory usage.
+     */
+    private function getProcessMemoryPeakMb(): float
+    {
+        if (PHP_OS_FAMILY === 'Linux' && is_readable('/proc/self/status')) {
+            $status = file_get_contents('/proc/self/status');
+            if ($status !== false) {
+                foreach (explode("\n", $status) as $line) {
+                    if (str_starts_with($line, 'VmHWM:')) {
+                        // Format: VmHWM:   123456 kB
+                        $parts = preg_split('/\s+/', $line);
+                        $kb = isset($parts[1]) ? (float)$parts[1] : 0.0;
+                        return $kb / 1024.0; // MB
+                    }
+                }
+            }
+        }
+
+        // Fallback: PHP peak only
+        return (float)memory_get_peak_usage(true) / 1048576;
     }
 }
