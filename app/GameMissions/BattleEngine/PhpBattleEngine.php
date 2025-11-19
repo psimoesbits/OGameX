@@ -29,7 +29,10 @@ class PhpBattleEngine extends BattleEngine
         $rounds = [];
 
         // Convert attacker and defender units to BattleUnit objects to keep track of hull plating and shields.
-        $attackerUnits = [];
+        $totalAttackerUnits = array_sum(array_map(fn ($u) => $u->amount, $result->attackerUnitsStart->units));
+        $attackerUnits = new \SplFixedArray($totalAttackerUnits);
+        $index = 0;
+
         foreach ($result->attackerUnitsStart->units as $unit) {
             // Create new object for each unique unit in the fleet.
             $structuralIntegrity = $unit->unitObject->properties->structural_integrity->calculate($this->attackerPlayer)->totalValue;
@@ -39,11 +42,14 @@ class PhpBattleEngine extends BattleEngine
 
             for ($i = 0; $i < $unit->amount; $i++) {
                 // Clone the unit object for each individual entry of this ship add it to the array.
-                $attackerUnits[] = clone $unitObject;
+                $attackerUnits[$index++] = clone $unitObject;
             }
         }
 
-        $defenderUnits = [];
+        $totalDefenderUnits = array_sum(array_map(fn ($u) => $u->amount, $result->defenderUnitsStart->units));
+        $defenderUnits = new \SplFixedArray($totalDefenderUnits);
+        $index = 0;
+
         foreach ($result->defenderUnitsStart->units as $unit) {
             // Create new object for each unique unit in the fleet.
             $structuralIntegrity = $unit->unitObject->properties->structural_integrity->calculate($this->defenderPlanet->getPlayer())->totalValue;
@@ -53,7 +59,7 @@ class PhpBattleEngine extends BattleEngine
 
             for ($i = 0; $i < $unit->amount; $i++) {
                 // Clone the unit object for each individual entry of this ship add it to the array.
-                $defenderUnits[] = clone $unitObject;
+                $defenderUnits[$index++] = clone $unitObject;
             }
         }
 
@@ -62,7 +68,7 @@ class PhpBattleEngine extends BattleEngine
         $defenderRemainingShips = clone $result->defenderUnitsStart;
         $attackerLosses = new UnitCollection();
         $defenderLosses = new UnitCollection();
-        while ($roundNumber < 6  && count($attackerUnits) > 0 && count($defenderUnits) > 0) {
+        while ($roundNumber < 6  && $attackerUnits->count() > 0 && $defenderUnits->count() > 0) {
             $roundNumber++;
             $round = new BattleResultRound();
             $round->defenderLossesInRound = new UnitCollection();
@@ -72,12 +78,18 @@ class PhpBattleEngine extends BattleEngine
 
             // Let the attacker attack the defender.
             foreach ($attackerUnits as $unit) {
+                if ($unit === null) {
+                    continue;
+                }
                 // Every single unit attacks a random unit from the defender's units.
                 // If the attacker has rapidfire against the defender and successfully rolled a dice,
                 // the attacker can attack a random unit again.
                 do {
-                    $targetUnitKey = array_rand($defenderUnits);
-                    $targetUnit = $defenderUnits[$targetUnitKey];
+                    $count = $defenderUnits->count();
+                    do {
+                        $targetUnitKey = mt_rand(0, $count - 1);
+                        $targetUnit = $defenderUnits[$targetUnitKey];
+                    } while ($targetUnit === null);
 
                     $rapidfire = $this->attackUnit(true, $round, $unit, $targetUnit);
                 } while ($rapidfire);
@@ -85,11 +97,17 @@ class PhpBattleEngine extends BattleEngine
 
             // Let the defender attack the attacker.
             foreach ($defenderUnits as $unit) {
+                if ($unit === null) {
+                    continue;
+                }
                 // If the attacker has rapidfire against the defender and successfully rolled a dice,
                 // the attacker can attack a random unit again.
                 do {
-                    $targetUnitKey = array_rand($attackerUnits);
-                    $targetUnit = $attackerUnits[$targetUnitKey];
+                    $count = $attackerUnits->count();
+                    do {
+                        $targetUnitKey = mt_rand(0, $count - 1);
+                        $targetUnit = $attackerUnits[$targetUnitKey];
+                    } while ($targetUnit === null);
 
                     $rapidfire = $this->attackUnit(false, $round, $unit, $targetUnit);
                 } while ($rapidfire);
@@ -195,34 +213,72 @@ class PhpBattleEngine extends BattleEngine
      * - Calculate the total damage dealt by the attacker and defender and calculate shield absorption stats.
      *
      * @param BattleResultRound $round.
-     * @param array<BattleUnit> $attackerUnits
-     * @param array<BattleUnit> $defenderUnits
+     * @param \SplFixedArray<BattleUnit> $attackerUnits
+     * @param \SplFixedArray<BattleUnit> $defenderUnits
      * @return void
      */
-    private function cleanupRound(BattleResultRound $round, array &$attackerUnits, array &$defenderUnits): void
+    private function cleanupRound(BattleResultRound $round, \SplFixedArray &$attackerUnits, \SplFixedArray &$defenderUnits): void
     {
+        $removed = 0;
+
         // Cleanup attacker units.
         foreach ($attackerUnits as $key => $unit) {
+            if ($unit === null) {
+                $removed++;
+                continue;
+            }
             if ($unit->currentHullPlating <= 0) {
                 // Remove destroyed units from the array.
                 $round->attackerLossesInRound->addUnit($unit->unitObject, 1);
-                unset($attackerUnits[$key]);
+                $attackerUnits[$key] = null;
+                $removed++;
             } else {
                 // Apply shield regeneration.
                 $unit->currentShieldPoints = $unit->originalShieldPoints;
             }
         }
 
+        if ($removed > $attackerUnits->count() / 2) {
+            $compacted = new \SplFixedArray($attackerUnits->count() - $removed);
+            $i = 0;
+            foreach ($attackerUnits as $key => $unit) {
+                if ($unit === null) {
+                    continue;
+                }
+                $compacted[$i++] = $unit;
+            }
+            $attackerUnits = $compacted;
+        }
+
+        $removed = 0;
+
         // Cleanup defender units.
         foreach ($defenderUnits as $key => $unit) {
+            if ($unit === null) {
+                $removed++;
+                continue;
+            }
             if ($unit->currentHullPlating <= 0) {
                 // Remove destroyed units from the array.
                 $round->defenderLossesInRound->addUnit($unit->unitObject, 1);
-                unset($defenderUnits[$key]);
+                $defenderUnits[$key] = null;
+                $removed++;
             } else {
                 // Apply shield regeneration.
                 $unit->currentShieldPoints = $unit->originalShieldPoints;
             }
+        }
+
+        if ($removed > $defenderUnits->count() / 2) {
+            $compacted = new \SplFixedArray($defenderUnits->count() - $removed);
+            $i = 0;
+            foreach ($defenderUnits as $key => $unit) {
+                if ($unit === null) {
+                    continue;
+                }
+                $compacted[$i++] = $unit;
+            }
+            $defenderUnits = $compacted;
         }
     }
 }
